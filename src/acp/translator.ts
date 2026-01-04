@@ -81,6 +81,18 @@ type PendingPrompt = {
   sentTextLength?: number;
   /** Actual text sent so far (for duplicate detection) */
   sentText?: string;
+  /** Keepalive timer */
+  keepaliveTimer?: ReturnType<typeof setInterval>;
+  /** Active tool calls (toolCallId -> true) */
+  activeToolCalls?: Set<string>;
+  /** Whether we've seen state=final for this prompt */
+  sawFinal?: boolean;
+  /** Whether we've seen job:done for this prompt */
+  sawJobDone?: boolean;
+  /** Gateway runId for this prompt's agent run */
+  gatewayRunId?: string;
+  /** job:started timestamp for THIS prompt */
+  jobStartedAt?: number;
 };
 
 /**
@@ -127,6 +139,12 @@ export class AcpGwAgent implements Agent {
 
   /** Map of sessionId -> pending prompt state */
   private pendingPrompts = new Map<string, PendingPrompt>();
+
+  /** Map of Gateway's internal sessionId -> ACP sessionId */
+  private gatewaySessionMap = new Map<string, string>();
+
+  /** Keepalive interval in ms - send a dot to prevent client timeout */
+  private readonly KEEPALIVE_MS = 5000;
 
   /**
    * Create a new ACP-Gateway translator.
@@ -245,9 +263,29 @@ export class AcpGwAgent implements Agent {
 
     if (!runId || !data) return;
 
-    // Find session by runId (set during prompt)
-    const session = getSessionByRunId(runId);
-    if (!session) return;
+    // Agent events use Gateway's internal sessionId as runId, not our idempotencyKey.
+    // Try to find our ACP sessionId via the mapping we build.
+    let acpSessionId = this.gatewaySessionMap.get(runId);
+    
+    // If this is a job start, map/update to the current pending prompt
+    const jobStartedAt = data.startedAt as number | undefined;
+    if (stream === "job" && data.state === "started" && jobStartedAt) {
+      // Find a pending prompt that either has no mapping OR has an older jobStartedAt
+      for (const [sessId, p] of this.pendingPrompts) {
+        if (p && (!p.jobStartedAt || jobStartedAt > p.jobStartedAt)) {
+          acpSessionId = sessId;
+          p.gatewayRunId = runId;
+          p.jobStartedAt = jobStartedAt;
+          this.gatewaySessionMap.set(runId, sessId);
+          this.log(`mapped gateway runId ${runId} (startedAt=${jobStartedAt}) -> ACP ${sessId}`);
+          break;
+        }
+      }
+    }
+    
+    const session = acpSessionId ? getSession(acpSessionId) : getSessionByRunId(runId);
+    const pending = acpSessionId ? this.pendingPrompts.get(acpSessionId) : 
+                   (session ? this.pendingPrompts.get(session.sessionId) : null);
 
     // Handle tool events
     if (stream === "tool") {
@@ -258,26 +296,98 @@ export class AcpGwAgent implements Agent {
       if (!toolCallId) return;
 
       if (phase === "start") {
-        await this.connection.sessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: "tool_call",
-            toolCallId,
-            title: name ?? "tool",
-            status: "running",
-          },
+        // Gateway sends two start events - first with args, second without.
+        // Only process the first one (with args) to show full tool info.
+        const args = data.args as Record<string, unknown> | undefined;
+        
+        // Skip duplicate start events (no args = second event)
+        if (!args) {
+          this.log(`tool started: ${toolCallId} (skipping duplicate without args)`);
+          return;
+        }
+        
+        // Track active tool call
+        if (pending) {
+          if (!pending.activeToolCalls) pending.activeToolCalls = new Set();
+          pending.activeToolCalls.add(toolCallId);
+        }
+        
+        // Build title with tool name and args
+        let title = name ?? "tool";
+        // Format args nicely - show key=value pairs
+        const argParts = Object.entries(args).map(([k, v]) => {
+          const val = typeof v === "string" ? v : JSON.stringify(v);
+          // Truncate long values
+          const truncated = val.length > 100 ? val.slice(0, 100) + "..." : val;
+          return `${k}: ${truncated}`;
         });
+        if (argParts.length > 0) {
+          title = `${name}: ${argParts.join(", ")}`;
+        }
+        this.log(`tool started: ${toolCallId}, title=${title}, session=${session?.sessionId}`);
+        
+        if (session) {
+          await this.connection.sessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId,
+              title,
+              status: "running",
+            },
+          });
+        }
       } else if (phase === "result") {
+        // Tool completed
+        this.log(`tool result: toolCallId=${toolCallId}, session=${session?.sessionId}, pending=${!!pending}`);
+        if (pending) {
+          pending.activeToolCalls?.delete(toolCallId);
+          this.log(`tool completed: ${toolCallId}, active=${pending.activeToolCalls?.size ?? 0}`);
+        }
         const isError = data.isError as boolean | undefined;
-        await this.connection.sessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: "tool_call_update",
-            toolCallId,
-            status: isError ? "error" : "completed",
-          },
-        });
+        if (session) {
+          this.log(`sending tool_call_update: completed for ${toolCallId}`);
+          await this.connection.sessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId,
+              status: isError ? "error" : "completed",
+            },
+          });
+        } else {
+          this.log(`tool result: no session, cannot send update`);
+        }
       }
+    }
+
+    // Handle job completion - mark as done but wait for state=final too
+    if (stream === "job" && data.state === "done") {
+      const doneStartedAt = data.startedAt as number | undefined;
+      if (pending && acpSessionId && pending.jobStartedAt === doneStartedAt) {
+        pending.sawJobDone = true;
+        this.log(`job done: sawJobDone=true, sawFinal=${pending.sawFinal} (startedAt=${doneStartedAt})`);
+        this.maybeResolve(acpSessionId, pending, runId);
+      } else {
+        this.log(`job done: ignoring (pending.jobStartedAt=${pending?.jobStartedAt}, doneStartedAt=${doneStartedAt})`);
+      }
+    }
+  }
+
+  /**
+   * Check if we can resolve a pending prompt.
+   * Resolves only when BOTH job:done AND state=final have been received.
+   */
+  private maybeResolve(acpSessionId: string, pending: PendingPrompt, runId: string): void {
+    if (pending.sawJobDone && pending.sawFinal) {
+      this.log(`maybeResolve: resolving session ${acpSessionId}`);
+      this.stopKeepalive(acpSessionId);
+      this.pendingPrompts.delete(acpSessionId);
+      this.gatewaySessionMap.delete(runId);
+      clearActiveRun(acpSessionId);
+      pending.resolve({ stopReason: "end_turn" });
+    } else {
+      this.log(`maybeResolve: waiting (sawJobDone=${pending.sawJobDone}, sawFinal=${pending.sawFinal})`);
     }
   }
 
@@ -302,9 +412,10 @@ export class AcpGwAgent implements Agent {
 
     const sessionKey = payload.sessionKey as string | undefined;
     const state = payload.state as string | undefined;
+    const runId = payload.runId as string | undefined;
     const messageData = payload.message as Record<string, unknown> | undefined;
 
-    this.log(`handleChatEvent: sessionKey=${sessionKey} state=${state}`);
+    this.log(`handleChatEvent: sessionKey=${sessionKey} state=${state} runId=${runId}`);
 
     if (!sessionKey) return;
 
@@ -312,6 +423,12 @@ export class AcpGwAgent implements Agent {
     const pending = this.findPendingBySessionKey(sessionKey);
     if (!pending) {
       this.log(`handleChatEvent: no pending for sessionKey=${sessionKey}`);
+      return;
+    }
+
+    // Verify this event is for our current prompt (not a stale one)
+    if (runId && pending.idempotencyKey !== runId) {
+      this.log(`handleChatEvent: runId mismatch, ignoring (expected=${pending.idempotencyKey}, got=${runId})`);
       return;
     }
 
@@ -324,25 +441,24 @@ export class AcpGwAgent implements Agent {
     }
 
     // Handle completion states
-    if (
-      state === "final" ||
-      state === "done" ||
-      state === "error" ||
-      state === "aborted"
-    ) {
-      this.log(`chat completed: state=${state} sessionId=${sessionId}`);
+    // NOTE: Don't resolve on state=final - it arrives before tools complete.
+    // Handle error/aborted - resolve immediately
+    if (state === "error" || state === "aborted") {
+      this.log(`chat error/aborted: state=${state} sessionId=${sessionId}`);
+      this.stopKeepalive(sessionId);
       this.pendingPrompts.delete(sessionId);
       clearActiveRun(sessionId);
 
-      // Map Gateway state to ACP StopReason
-      const stopReason: StopReason =
-        state === "final" || state === "done"
-          ? "end_turn"
-          : state === "aborted"
-            ? "cancelled"
-            : "refusal";
-
+      const stopReason: StopReason = state === "aborted" ? "cancelled" : "refusal";
       pending.resolve({ stopReason });
+    }
+    // For final/done, mark sawFinal and check if we can resolve
+    if (state === "final" || state === "done") {
+      pending.sawFinal = true;
+      this.log(`chat final: sawFinal=true, sawJobDone=${pending.sawJobDone}`);
+      // Need the gatewayRunId to clean up mapping - get it from pending
+      const gwRunId = pending.gatewayRunId ?? "";
+      this.maybeResolve(sessionId, pending, gwRunId);
     }
   }
 
@@ -400,6 +516,26 @@ export class AcpGwAgent implements Agent {
           content: { type: "text", text: newText },
         },
       });
+    }
+  }
+
+  /**
+   * Start keepalive timer for a session.
+   * Sends "." every few seconds to prevent client timeout.
+   */
+  private startKeepalive(_sessionId: string): void {
+    // Keepalive disabled - tool call updates provide sufficient activity
+    // to prevent client timeout. The dots were visually noisy.
+  }
+
+  /**
+   * Stop keepalive timer for a session.
+   */
+  private stopKeepalive(sessionId: string): void {
+    const pending = this.pendingPrompts.get(sessionId);
+    if (pending?.keepaliveTimer) {
+      clearInterval(pending.keepaliveTimer);
+      pending.keepaliveTimer = undefined;
     }
   }
 
@@ -570,12 +706,18 @@ export class AcpGwAgent implements Agent {
 
     return new Promise<PromptResponse>((resolve, reject) => {
       // Track this prompt for event correlation
+      // jobStartedAt will be set when we see job:started - used to match job:done
       this.pendingPrompts.set(params.sessionId, {
         sessionId: params.sessionId,
         idempotencyKey: runId,
         resolve,
         reject,
+        gatewayRunId: undefined,
+        jobStartedAt: undefined,  // Will be set when we see job:started
       });
+
+      // Start keepalive to prevent client timeout
+      this.startKeepalive(params.sessionId);
 
       // Send to Gateway
       this.gateway
@@ -591,6 +733,7 @@ export class AcpGwAgent implements Agent {
         )
         .catch((err) => {
           // Clean up on error
+          this.stopKeepalive(params.sessionId);
           this.pendingPrompts.delete(params.sessionId);
           clearActiveRun(params.sessionId);
           reject(err);
@@ -629,6 +772,7 @@ export class AcpGwAgent implements Agent {
     // Resolve the pending promise
     const pending = this.pendingPrompts.get(params.sessionId);
     if (pending) {
+      this.stopKeepalive(params.sessionId);
       this.pendingPrompts.delete(params.sessionId);
       pending.resolve({ stopReason: "cancelled" });
     }
